@@ -181,17 +181,17 @@
  #include <sys/sockio.h>
 #endif
 
-#define DEBUG
+#define DEBUG			1
 
 #define ENCRYPT			1
-#define FORCE_UPDATE		0
+#define FORCE_UPDATE		1
 
 #define MAX(x,y)		(((x)>(y))?(x):(y))
 
 #define READ_TIMEOUT		90
 #define WRITE_TIMEOUT		60
 #define CONNECT_TIMEOUT		60
-#define FORCE_INTERVAL		(1440 * 30)	// 30 days in minutes
+#define FORCE_INTERVAL		1440	// 30 days in minutes
 
 #define IPLEN			16
 #define LINELEN 	        256
@@ -217,9 +217,9 @@
   #define UPDATE_SCRIPT		"ducupdate.php"
 
 #ifdef DEBUG
-  #define OPTCHARS		"CYU:Fc:dD:hp:u:x:SMi:K:I:z"
+  #define OPTCHARS		"CYU:Fc:dD:hp:o:u:x:SMi:K:I:z"
 #else
-  #define OPTCHARS		"CYU:Fc:hp:u:x:SMi:K:I:z"
+  #define OPTCHARS		"CYU:Fc:hp:o:u:x:SMi:K:I:z"
 #endif
 #define ARGC			1
 #define ARGF			(1<<1)
@@ -239,11 +239,7 @@
 #define HOST			1
 #define GROUP			2
 #define DOMAIN			3
-#ifndef PREFIX
-  #define PREFIX		"/usr/local"
-#endif
-#define CONFIG_FILEPATH		PREFIX"/etc"
-#define CONFIG_FILENAME		PREFIX"/etc/no-ip2.conf"
+#define CONFIG_FILENAME		"/tmp/noip2.conf"
 #define CONFSTRLEN		1024
 #define MAX_DEVLEN		16
 #define MAX_INSTANCE		4
@@ -344,6 +340,7 @@
 #define CMSG100 \
 "Error! -C option can only be used with -F -Y -U -I -c -u -p -x options."
 #define CMSG101	" Both -u and -p options must be used together."
+#define DNI_NOIP_SUPORT 1
 
 int	debug			= 	0;
 int	timed_out		=	0;
@@ -378,10 +375,12 @@ char	*config_filename	=	NULL;
 char	*request		=	NULL;
 char	*pid_path		=	NULL;
 char	*execpath		=	NULL;
+char	*supplied_host_group	=	NULL;
 char	*supplied_username	=	NULL;
 char	*supplied_password	=	NULL;
 char	*supplied_executable	=	NULL;
 char	IPaddress[IPLEN];
+char	get_address[IPLEN];
 char	login[LINELEN];
 char	password[LINELEN];
 char	device[LINELEN];
@@ -472,6 +471,7 @@ unsigned char EncodeTable[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 ///////////////////////////////////////////////////////////////////////////
+void	show_ddns_status(int flag,char *host);
 void	process_options(int argc, char *argv[]);
 void	update_handler(int signum);
 void	alarm_handler(int signum);
@@ -517,7 +517,7 @@ void SkipHeaders();
 void	url_encode(char *in, char *out);
 void	get_credentials(char *l, char *p);
 void	get_device_name(char *d);
-void	autoconf();
+int	autoconf();
 int     bencode(const char *s, char *dst);
 int     bdecode(char *in, char *out);
 void	Msg(char *fmt, ...);
@@ -537,6 +537,7 @@ void Usage()
 	fprintf(stderr, "         -F               force NAT off\n");
 	fprintf(stderr, "         -Y               select all hosts/groups\n");
 	fprintf(stderr, "         -U minutes       set update interval\n");
+	fprintf(stderr, "         -o hostname      use supplied hostname\n");
 	fprintf(stderr, "         -u username      use supplied username\n");
 	fprintf(stderr, "         -p password      use supplied password\n");
 	fprintf(stderr, "         -x executable    use supplied executable\n");
@@ -586,21 +587,38 @@ int main(int argc, char *argv[])
 	if (config_filename == NULL) 
 	    config_filename = CONFIG_FILENAME;
         if (needs_conf) {
-            autoconf();
-            exit(0);
+            if((autoconf()) < 0){
+		Msg("Auto config failed.");
+		return -1;
+	    }	
+//          exit(0);
         }
+
 	if (handle_config_error(parse_config()) != SUCCESS) 
 	    return -1;
-
         /* drop root privileges after reading config */
-        if (geteuid() == 0) {
+		/***************************************************************************************************************/	
+		/* DNI bug-46698 [SQA-0325][no-ip]The status shows a wrong information, even if the IP is updated on the no-ip 
+		 * server.
+		 *
+		 * Root cause:
+		 *		 File /tmp/ez-ipupd.status is cretated in funcation autoconf.Because the file creation mode  mask is 
+		 *		 0022,mode of ez-ipupd.status is 0644. After UID is changed to "nobody", process has no permission to 
+		 *		 write file ez-ipupd.status. File /etc/passwd does NOT include "nobody" user in other project,such as
+		 *		 wndr4700.
+		 *
+		 * Solution
+		 *		Like wndr4700,We just let root as the owner of the process in case of unknown issue. 
+		 */
+		/***************************************************************************************************************/
+      /*  if (geteuid() == 0) {
             if ((nobody = getpwnam("nobody")) != NULL) { // if "nobody" exists
 	        setgid(nobody->pw_gid);
         	setegid(nobody->pw_gid);
                 setuid(nobody->pw_uid);
                 seteuid(nobody->pw_uid);
-	    }
-	}
+			}
+		}*/
 
 	if (*IPaddress != 0) {
 	    if (background) {
@@ -653,6 +671,30 @@ int main(int argc, char *argv[])
 	return 0;
 }
 ///////////////////////////////////////////////////////////////////////////
+void show_ddns_status(int flag,char host[])
+{
+	FILE *fp;
+	if(!(fp = fopen("/tmp/ez-ipupd.status", "w")))
+	{
+		printf("can not creat /tmp/ez-ipupd.status\n");
+		return;
+	}
+	fprintf(fp,"%d",flag);
+	fclose(fp);
+	switch(flag) {
+		case 1:
+			syslog(LOG_INFO, "[Dynamic DNS] host name %s registeration successful", host);
+			break;
+		case 2:
+		case 3:
+		case 4:
+		case 5:
+			syslog(LOG_INFO, "[Dynamic DNS] host name %s registeration failure,", host);
+			break;
+	}
+	if (flag == 1 || flag == 5)
+		system("date > /tmp/ez-ipupd.time");
+}
 void process_options(int argc, char *argv[])
 {
 	extern  int     optind, opterr;
@@ -695,6 +737,9 @@ void process_options(int argc, char *argv[])
 			have_args |= ARGD;
 			break;
 #endif
+		case 'o':
+			supplied_host_group = optarg;
+			break;
 		case 'u':
 			supplied_username = optarg;
 			have_args |= ARGu;
@@ -1019,9 +1064,11 @@ int get_shm_info()
 /////////////////////////////////////////////////////////////////////////
 int run_as_background()
 {
-	int	x, delay;
+	int	x, delay,return_error = 0,update_num = 0;
 	char	*err_string;
 	static int startup = 1;
+	FILE *fp;
+	int last_status;
 
 	x = fork();
 	switch (x) {
@@ -1043,7 +1090,7 @@ int run_as_background()
 		syslog(LOG_INFO, "v%s daemon started%s\n", 
 			VERSION, (nat) ?  " with NAT enabled" : "");
 		while (background) {
-		    delay = MAX(60, my_instance->interval * 60);
+		    delay = my_instance->interval ;
 		    if (nat)
 			get_our_visible_IPaddr(IPaddress);
 		    else
@@ -1062,14 +1109,39 @@ int run_as_background()
 #endif
 		    if (*IPaddress) { 
 			if (strcmp(IPaddress, my_instance->Last_IP_Addr)) {
-			    if (dynamic_update() == SUCCESS) 
+			    if ((return_error = dynamic_update()) == SUCCESS){ 
 				strncpy(my_instance->Last_IP_Addr, IPaddress,
 									IPLEN);
-			    if (connect_fail)
-				delay = MAX(300, delay); // wait at least 5 minutes more
+				show_ddns_status(1,IPaddress);
+			    }
+			    if (connect_fail){
+				if(return_error == BADPASSWD || return_error == BADUSER)
+				   show_ddns_status(3,IPaddress);
+				else if(return_error == BADHOST)
+				   show_ddns_status(4,IPaddress);
+				else
+				   show_ddns_status(5,IPaddress);
+				update_num++;
+				if(update_num < 7){
+				   delay = 30; // wait 30 seconds
+				}else if(update_num == 7){
+				   update_num = 0;
+				   delay = 60 * 60;
+				}
+			    }else 
+				update_num = 0;
 			    *IPaddress = 0;
 			}
-		    }
+//compare last status and corrent status
+			if((fp=fopen("/tmp/ez-ipupd.status","r")) != NULL)
+			{
+				last_status=fgetc(fp)-'0';
+				fclose(fp);
+				if(last_status !=1)
+					show_ddns_status(1,IPaddress);
+			}
+		    }else 
+			show_ddns_status(2,"0.0.0.0");
 #if FORCE_UPDATE
 		    if (Force_Update < 0) {
 			if (force_update() == SUCCESS)
@@ -1504,12 +1576,14 @@ int parse_config()
 	interval = new_config->interval;
 	nat = new_config->nat;
 	reqnum = new_config->count;
+#if 0
 	if (show_config || debug_toggle || kill_proc || update_cycle) {
 	    display_current_config();
 	    free(request);
 	    free(new_config);
 	    exit(0);
 	}
+#endif
 	if (new_config->count == 0)
 	    return BADCONFIG5;
 	return SUCCESS;
@@ -1867,12 +1941,14 @@ int hosts(char *p)
 int xmlerr(char *p)
 {
         if (strncmp(p, "No Hosts", 8) == 0) {
+            show_ddns_status(4,get_address);
             Msg(CMSG06);
             Msg(CMSG07);
             Msg(CMSG08);
             return 1;
         }
         if (strncmp(p, "Bad Password", 12) == 0) {
+            show_ddns_status(3,get_address);
             Msg(CMSG09);
             Msg(CMSG10);
             Msg(CMSG11);
@@ -1995,12 +2071,61 @@ int add_to_request(int kind, char *p)
 //////////////////////////////////////////////////////////////////////////
 int get_update_selection(int tgrp, int thst)
 {
-	int	prompt, x, len=0;
+	int	prompt, x, all_num = 0, len=0;
         struct	GROUPS *g = groups;
         struct	NAMES *n;
+	char	*point1 = NULL,*point2 = NULL;
+	char	host_group[128][50];    //used to save the host or group.
+	int	num = 0;
 
 	reqnum = 0;					// no requests yet
 	sprintf(buffer, "%s%s%s%s", USTRNG, login, PWDSTRNG, password);
+#ifdef DNI_NOIP_SUPORT	
+	point2 = point1 = supplied_host_group;
+	while(*point2){
+	   if (*point2 == ','){
+		*point2 = '\0';
+		strcpy(host_group[++num],point1);
+		point1 = ++point2;
+	   }else 
+		point2++;
+	}
+	if(*point1)
+	   strcpy(host_group[++num],point1);
+
+	while(num > 0){
+	    g = groups;
+	    while(g){
+		if (g->grp != 0 && (strcmp(g->grp,host_group[num])) == 0){          // we have a named group
+		    len = add_to_request(GROUP, g->grp);
+		    all_num++;
+		}else{
+		    n = g->nlink;
+		    while (n) {
+			if((strcmp(n->fqdn,host_group[num])) == 0){
+			   len = add_to_request(HOST, n->fqdn);
+			   all_num++;
+			}
+			else
+			   show_ddns_status(4,get_address);
+			n = n->link;
+		    }
+		}
+		g = g->glink;
+		if (len > 600) {
+		    Msg(CMSG16);
+		    Msg(CMSG17);
+		    return -1;
+		}
+	    }
+	    num--;
+	}
+	if(all_num == 0){
+	    printf("\nNo host or group!\n");
+	    return -1;
+	}
+	return len;
+#else		
 	if ((thst == 1) && (tgrp == 0)) {
 	    Msg(CMSG12, g->nlink->fqdn);
 	    Msg(CMSG13);
@@ -2060,6 +2185,7 @@ int get_update_selection(int tgrp, int thst)
 	    }
         }
 	return len;
+#endif
 }
 //////////////////////////////////////////////////////////////////////////
 void SkipHeaders()
@@ -2465,7 +2591,7 @@ void get_device_name(char *d)
 	}
 }
 /////////////////////////////////////////////////////////////////////////////
-void autoconf()
+int autoconf()
 {
 	int	x, xfd;
 	int	a, b, c;
@@ -2491,7 +2617,8 @@ void autoconf()
 	    Msg(CMSG25, config_filename);
 	    perror("");
 	    Msg(CMSG25a);
-	    exit(1);
+	    return -1;
+//	    exit(1);
 	}
 	fd = fdopen(xfd, "w");
 	new_config = (struct CONFIG *)Malloc(sizeof(struct CONFIG));
@@ -2508,18 +2635,20 @@ void autoconf()
         if ((x = Connect(port_to_use)) != SUCCESS) { 
             handle_dynup_error(x);
 	    Msg(CMSG27);
-	    return;
+	    show_ddns_status(2,"0.0.0.0");
+	    return -1;
 	}
         sprintf(buffer, "GET http://%s/\r\n\r\n", NOIP_IP_SCRIPT);
         if ((x = converse_with_web_server()) <= 0) {
             handle_dynup_error(x);
-	    return;
+	    return -1;
 	}
         p = buffer;
         if ((*p >= '0') && (*p <= '9')) {	// extract IP address
 	    if (!validate_IP_addr(buffer, external_ip)) {
 		Msg(CMSG44, p);
-		exit(1);
+		return -1;
+//		exit(1);
 	    }
         }
 #ifdef DEBUG
@@ -2530,10 +2659,14 @@ void autoconf()
         getip(internal_ip, device);
         if (!firewallbox && (strcmp(internal_ip, external_ip) != 0))
             nat++;
+	if (nat)
+		get_our_visible_IPaddr(get_address);
+	else
+		getip(get_address, device);
 	get_credentials(login, password);
         if ((x = Connect(port_to_use)) != SUCCESS) {
             handle_dynup_error(x);
-	    return;
+	    return -1;
 	}
 	sprintf(line, "%s%s%s%s", USTRNG, login, PWDSTRNG, password);
 	bencode(line, encline);
@@ -2541,7 +2674,7 @@ void autoconf()
        		NOIP_NAME, SETTING_SCRIPT, REQUEST, encline, USER_AGENT);
         if ((x = converse_with_web_server()) <= 0) {
             handle_dynup_error(x);
-	    return;
+	    return -1;
 	}
         close(socket_fd);
 
@@ -2559,17 +2692,17 @@ void autoconf()
             while (strncmp(p, s->keyword, s->len) != 0) 
                 s++;
             if (s->func(line))                    // process line
-		return;
+		return -1;
         }
         groups->grp = 0;                       // remove marker
 	if ((groups->count != 0) || (groups->ncount != 0)) {
             x = get_update_selection(groups->count, groups->ncount);
 	    if ( x < 0)
-		return;
+		return -2;
 	}
 	if (reqnum == 0) {
 	    Msg(CMSG29, config_filename);
-	    return;
+	    return -1;
 	}
 	request = (char *)Malloc(x*2);	// get enough space
 	new_config->rlength = bencode(buffer, request);
@@ -2622,10 +2755,11 @@ void autoconf()
             perror("");
             Msg(CMSG25a);
 	    unlink(tmp_filename);
-            exit(1);
+	    return -1;
+//          exit(1);
 	}
 	Msg(CMSG28, config_filename);
-	return;
+	return 1;
 }
 /////////////////////////////////////////////////////////////////////////
 int bencode(const char *p_s, char *p_dst)
